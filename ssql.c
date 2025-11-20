@@ -13,6 +13,13 @@ void unused() {}
 #define UNREACHABLE() assert(false && "Unreachable!")
 #define UNIMPLEMENTED() assert(false && "Unimplemented!")
 
+typedef struct Arena {
+    struct Arena *next;
+    size_t allocated;
+    size_t used;
+    uint8_t data[];
+} Arena;
+
 typedef enum Token_Kind {
     Token_Kind__None = 0,
 
@@ -57,6 +64,7 @@ typedef struct Lexer {
     size_t tokens_used;
     size_t tokens_allocated;
     Token *next_token;
+    Arena *strings;
 } Lexer;
 
 typedef enum Lexer_Status {
@@ -68,6 +76,52 @@ typedef enum Lexer_Status {
     Lexer_Status__Ok = 0,
     Lexer_Status__Token_Found = 1,
 } Lexer_Status;
+
+Arena *arena_create(size_t size)
+{
+    Arena *arena = malloc(sizeof *arena + size);
+    assert(arena != NULL);
+    arena->next = NULL;
+    arena->allocated = size;
+    arena->used = 0;
+    return arena;
+}
+
+void arena_destroy(Arena *arena)
+{
+    if (arena->next != NULL) arena_destroy(arena->next);
+    free(arena);
+}
+
+void *arena_allocate_aligned(Arena *arena, size_t size, size_t alignment)
+{
+    size_t offset = (alignment - (arena->used & (alignment - 1))) & (alignment - 1);
+
+    size_t space = (arena->allocated - arena->used) - offset;
+    if (space < size) {
+        if (arena->next == NULL) arena->next = arena_create(size > arena->allocated ? size : arena->allocated);
+        return arena_allocate_aligned(arena->next, size, alignment);
+    }
+
+    void *position = &arena->data[arena->used + offset];
+    arena->used += size + offset;
+    return position;
+}
+
+void *arena_allocate(Arena *arena, size_t size)
+{
+    typedef union { long l; double d; void *p; } Max_Align;
+    
+    return arena_allocate_aligned(arena, size, sizeof (Max_Align));
+}
+
+char *arena_duplicate_string(Arena *arena, const char *from, size_t length)
+{
+    char *into = arena_allocate_aligned(arena, length + 1, 1);
+    for (size_t i = 0; i < length; ++i) into[i] = from[i];
+    into[length] = '\0';
+    return into;
+}
 
 const char *lexer_status_name(Lexer_Status status)
 {
@@ -135,6 +189,7 @@ void lexer_setup(Lexer *lexer, const char *source, size_t source_length)
     lexer->tokens_allocated = 64;
     lexer->tokens = malloc(lexer->tokens_allocated * sizeof lexer->tokens[0]);
     assert(lexer->tokens != NULL);
+    lexer->strings = arena_create(64);
 }
 
 void lexer_teardown(Lexer *lexer)
@@ -142,13 +197,11 @@ void lexer_teardown(Lexer *lexer)
     if (lexer == NULL) return;
 
     if (lexer->tokens != NULL) {
-        for (size_t i = 0; i < lexer->tokens_used; ++i) {
-            if (lexer->tokens[i].literal != NULL) free(lexer->tokens[i].literal);
-        }
-
         free(lexer->tokens);
         lexer->tokens = NULL;
     }
+
+    if (lexer->strings != NULL) arena_destroy(lexer->strings);
 }
 
 Token *lexer_next_token(Lexer *lexer, Token_Kind kind)
@@ -209,17 +262,6 @@ bool is_identifier_tail(char rune)
     return isalnum(rune) || rune == '_';
 }
 
-char *duplicate_string(const char *from, size_t length)
-{
-    char *into = malloc(length + 1);
-    assert(into != NULL);
-
-    for (size_t i = 0; i < length; ++i) into[i] = from[i];
-
-    into[length] = '\0';
-    return into;
-}
-
 Lexer_Status lexer_tokenize_identifier(Lexer *lexer)
 {
     Token *token = lexer_next_token(lexer, Token_Kind__Identifier);
@@ -242,7 +284,7 @@ Lexer_Status lexer_tokenize_identifier(Lexer *lexer)
         return Lexer_Status__Ok;
     }
 
-    token->literal = duplicate_string(literal, token->literal_length);
+    token->literal = arena_duplicate_string(lexer->strings, literal, token->literal_length);
     lexer_accept_token(lexer);
     return Lexer_Status__Token_Found;
 }
@@ -281,7 +323,7 @@ Lexer_Status lexer_tokenize_literal(Lexer *lexer)
         return Lexer_Status__Ok;
     }
 
-    token->literal = duplicate_string(literal, token->literal_length);
+    token->literal = arena_duplicate_string(lexer->strings, literal, token->literal_length);
     lexer_accept_token(lexer);
     return Lexer_Status__Token_Found;
 }
