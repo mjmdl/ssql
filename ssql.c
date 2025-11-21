@@ -247,11 +247,6 @@ void lexer_skip_whitespace(Lexer *lexer)
     while (!lexer_is_end(lexer) && isspace(lexer->head[0])) ++lexer->head;
 }
 
-bool lexer_is_double_quote(Lexer *lexer)
-{
-    return lexer->head[0] == '"' && (lexer->head == lexer->begin || lexer->head[-1] != '\\');
-}
-
 bool is_identifier_head(char rune)
 {
     return isalpha(rune) || rune == '_';
@@ -262,31 +257,72 @@ bool is_identifier_tail(char rune)
     return isalnum(rune) || rune == '_';
 }
 
+Lexer_Status lexer_chop_string(Lexer *lexer, char delimiter)
+{
+    if (lexer->head[0] != delimiter) return Lexer_Status__Ok;
+    
+    bool delimiter_found = false;
+    ++lexer->head;
+    while (!lexer_is_end(lexer)) {
+        if (delimiter_found) { /* Handle escaping. */
+            delimiter_found = false;
+            if (lexer->head[0] != delimiter) break;
+        } else if (lexer->head[0] == delimiter) delimiter_found = true;
+
+        ++lexer->head;
+    }
+
+    if (delimiter_found) return Lexer_Status__Invalid_String;
+    return Lexer_Status__Token_Found;
+}
+
+Lexer_Status lexer_chop_simple_identifier(Lexer *lexer)
+{
+    if (!is_identifier_head(lexer->head[0])) return Lexer_Status__Ok;
+    do ++lexer->head; while (!lexer_is_end(lexer) && is_identifier_tail(lexer->head[0]));
+    return Lexer_Status__Token_Found;
+}
+
+Lexer_Status lexer_chop_quoted_identifier(Lexer *lexer)
+{
+    return lexer_chop_string(lexer, '"');
+}
+
 Lexer_Status lexer_tokenize_identifier(Lexer *lexer)
 {
     Token *token = lexer_next_token(lexer, Token_Kind__Identifier);
     const char *literal = &lexer->begin[token->position];
 
-    if (is_identifier_head(lexer->head[0])) {
-        /* Tokenize simple identifiers (e.g. `table_name`): */
-        do ++lexer->head; while (!lexer_is_end(lexer) && is_identifier_tail(lexer->head[0]));
-
+    Lexer_Status status;
+    if ((status = lexer_chop_simple_identifier(lexer)) != Lexer_Status__Ok) {
+        if (status != Lexer_Status__Token_Found) return status;
         token->literal_length = lexer->head - literal;
-    } else if (lexer_is_double_quote(lexer)) {
-        /* Tokenize quoted identifiers (e.g. `"Table Name"`): */
-        do ++lexer->head; while (!lexer_is_end(lexer) && !lexer_is_double_quote(lexer));
-
+    } else if ((status = lexer_chop_quoted_identifier(lexer)) != Lexer_Status__Ok) {
+        if (status != Lexer_Status__Token_Found) return status;
         ++literal; /* Exclude opening quote from literal. */
-        ++lexer->head; /* Skip closing quote from source. */
         token->literal_length = lexer->head - literal - 1;
-    } else {
-        /* Token is not a identifier. */
-        return Lexer_Status__Ok;
-    }
+    } else return Lexer_Status__Ok;
 
     token->literal = arena_duplicate_string(lexer->strings, literal, token->literal_length);
     lexer_accept_token(lexer);
     return Lexer_Status__Token_Found;
+}
+
+Lexer_Status lexer_chop_literal_number(Lexer *lexer)
+{
+    if (!(isdigit(lexer->head[0]) || (lexer->head[0] == '.' && lexer->head != lexer->end && isdigit(lexer->head[1])))) return Lexer_Status__Ok;
+
+    char *end;
+    UNUSED(strtod(lexer->head, &end));
+
+    if (lexer->head == end) return Lexer_Status__Invalid_Number;
+    lexer->head = end;
+    return Lexer_Status__Token_Found;
+}
+
+Lexer_Status lexer_chop_literal_text(Lexer *lexer)
+{
+    return lexer_chop_string(lexer, '\'');
 }
 
 Lexer_Status lexer_tokenize_literal(Lexer *lexer)
@@ -294,34 +330,17 @@ Lexer_Status lexer_tokenize_literal(Lexer *lexer)
     Token *token = lexer_next_token(lexer, Token_Kind__None);
     const char *literal = &lexer->begin[token->position];
 
-    if (isdigit(lexer->head[0]) || (lexer->head[0] == '.' && lexer->head != lexer->end && isdigit(lexer->head[1]))) {
-        /* Tokenize numeric literal: */
+    Lexer_Status status;
+    if ((status = lexer_chop_literal_number(lexer)) != Lexer_Status__Ok) {
+        if (status != Lexer_Status__Token_Found) return status;
         token->kind = Token_Kind__Literal_Number;
-
-        char *end;
-        UNUSED(strtod(lexer->head, &end));
-
-        if (lexer->head == end) return Lexer_Status__Invalid_Number;
-
-        lexer->head = end;
         token->literal_length = lexer->head - literal;
-    } else if (lexer->head[0] == '\'' && (lexer->head == lexer->begin || lexer->head[-1] != '\\')) {
-        /* Tokenize text literal: */
+    } else if ((status = lexer_chop_literal_text(lexer)) != Lexer_Status__Ok) {
+        if (status != Lexer_Status__Token_Found) return status;
         token->kind = Token_Kind__Literal_Text;
-
-        do {
-            ++lexer->head;
-
-            if (lexer->head >= lexer->end) return Lexer_Status__Unclosed_String;
-        } while (lexer->head[0] != '\'' || lexer->head[-1] == '\\');
-
         ++literal; /* Exclude opening quote from string. */
-        ++lexer->head; /* Skip closing quote from source. */
         token->literal_length = lexer->head - literal - 1;
-    } else {
-        /* Token is not a literal: */
-        return Lexer_Status__Ok;
-    }
+    } else return Lexer_Status__Ok;
 
     token->literal = arena_duplicate_string(lexer->strings, literal, token->literal_length);
     lexer_accept_token(lexer);
@@ -408,7 +427,7 @@ Lexer_Status lexer_skip_comment(Lexer *lexer)
     }
 
     /* Skip multiline comments (between / * and * /): */
-    if (head[0] == '/' && (head == lexer->begin || head[-1] != '\\')) {
+    if (head[0] == '/') {
         ++head;
         if (head >= lexer->end || head[0] != '*') return Lexer_Status__Ok;
 
@@ -455,15 +474,15 @@ int main(int argc, char **argv)
     const char *input =
         "-- List players victories and scores.\n"
         "SELECT\n"
-        "    player.id AS \"Player ID\",\n"
+        "    player.id AS \"Player ID\", 1000 420.69 .55435 .545aasd \n"
         "    player.nick_name AS \"Nickname\",\n"
-        "    AGE(CURRENT_TIMESTAMP, player.created_at) AS \"Account age\",\n"
+        "    AGE(CURRENT_TIMESTAMP, player.created_at) AS \"\"\"Account\"\" age\",\n"
         "    SUM(match.score) AS \"Total Score\",\n"
         "    COUNT(CASE WHEN match.state = 'won' THEN 1 END) AS \"Victories\"\n"
         "FROM game.player\n"
         "LEFT JOIN game.player_match match\n"
         "    ON match.player_id = player.id\n"
-        "WHERE player.status != 'inactive'\n"
+        "WHERE player.status != 'inac''tive'\n"
         "    AND player.rank >= 2000\n"
         "    /*AND player.rank BETWEEN 2000 AND 3000*/\n"
         "    AND player.deleted_at IS NULL\n"
